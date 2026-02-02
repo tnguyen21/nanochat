@@ -230,7 +230,7 @@ def forward_model(model, input_ids):
 
 
 @torch.no_grad()
-def generate_greedy(model, input_ids, max_new_tokens):
+def generate_greedy(model, input_ids, max_new_tokens, eos_token_id=None):
     """Simple greedy generation loop"""
     generated = []
     curr_ids = input_ids.clone()
@@ -247,8 +247,11 @@ def generate_greedy(model, input_ids, max_new_tokens):
         next_token_logits = logits[:, -1, :]
         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
-        curr_ids = torch.cat([curr_ids, next_token], dim=1)
         token_id = next_token.item()
+        if eos_token_id is not None and token_id == eos_token_id:
+            break
+
+        curr_ids = torch.cat([curr_ids, next_token], dim=1)
         generated.append(token_id)
 
     return torch.tensor(generated, dtype=torch.long, device=input_ids.device)
@@ -333,7 +336,20 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
 
         prompt_ids = input_ids[:, :si]
         # Generate greedily
-        generated_ids = generate_greedy(model, prompt_ids, max_new_tokens=512)
+        # Try to find a reasonable EOS token.
+        # For base models, we often rely on max length or newlines, but let's try to find <|endoftext|> or <|eos|>
+        # The tokenizer interface in nanochat varies (HF vs RustBPE).
+        eos_id = None
+        if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+             eos_id = tokenizer.eos_token_id
+        elif hasattr(tokenizer, 'encode_special'):
+             # Try common special tokens
+             try:
+                 eos_id = tokenizer.encode_special("<|endoftext|>")
+             except:
+                 pass
+
+        generated_ids = generate_greedy(model, prompt_ids, max_new_tokens=512, eos_token_id=eos_id)
 
         # Decode and compare using AST
         predicted_text = tokenizer.decode(generated_ids.tolist())
