@@ -89,6 +89,110 @@ def get_hf_token_bytes(tokenizer, device="cpu"):
     return token_bytes
 
 # -----------------------------------------------------------------------------
+# BFCL evaluation
+
+def format_bfcl_tool_definition(func):
+    """Format a single BFCL function definition into a Python-like signature + docstring."""
+    name = func['name']
+    desc = func['description']
+    params = func['parameters']
+
+    args = []
+    if params['type'] == 'dict':
+        for prop_name, prop_def in params.get('properties', {}).items():
+            p_type = prop_def.get('type', 'Any')
+            args.append(f"{prop_name}: {p_type}")
+
+    sig = f"def {name}({', '.join(args)}):"
+    doc = f'    """{desc}"""'
+    return f"{sig}\n{doc}"
+
+def evaluate_bfcl(model, tokenizer, device, max_per_task=-1):
+    """
+    Evaluate on Berkeley Function Calling Leaderboard (subset exec_simple).
+    Downloads dataset on the fly.
+    """
+    from huggingface_hub import hf_hub_download
+
+    print0("Downloading BFCL data (BFCL_v3_exec_simple.json)...")
+    try:
+        file_path = hf_hub_download(
+            repo_id="gorilla-llm/Berkeley-Function-Calling-Leaderboard",
+            filename="BFCL_v3_exec_simple.json",
+            repo_type="dataset"
+        )
+    except Exception as e:
+        print0(f"Failed to download BFCL data: {e}")
+        return {"accuracy": 0.0}
+
+    loaded_items = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+             # Try loading as a list first
+             content = f.read().strip()
+             try:
+                 loaded_items = json.loads(content)
+                 if not isinstance(loaded_items, list):
+                     # Maybe it's a dict with a key?
+                     loaded_items = [loaded_items]
+             except json.JSONDecodeError:
+                 # Try jsonl
+                 f.seek(0)
+                 loaded_items = [json.loads(line) for line in f if line.strip()]
+    except Exception as e:
+        print0(f"Error reading BFCL file: {e}")
+        return {"accuracy": 0.0}
+
+    # Format items
+    for item in loaded_items:
+        # Structure:
+        # question: [[{'role': 'user', 'content': '...'}]]
+        # function: list of dicts
+        # ground_truth: list of strings (function calls)
+
+        # Extract question
+        q_list = item.get('question', [])
+        if not q_list: continue
+        # Handle nested list structure [[{...}]] or [{...}]
+        if isinstance(q_list[0], list):
+            user_msg = q_list[0][0]['content']
+        else:
+            user_msg = q_list[0]['content']
+
+        # Extract functions
+        functions = item.get('function', [])
+        tools_str = "\n\n".join([format_bfcl_tool_definition(f) for f in functions])
+
+        # Context
+        context = f"{tools_str}\n\nUser: {user_msg}\nAssistant: "
+
+        # Continuation (Ground Truth)
+        gt_list = item.get('ground_truth', [])
+        if not gt_list: continue
+        continuation = gt_list[0]
+
+        data.append({
+            'context': context,
+            'continuation': continuation
+        })
+
+    if max_per_task > 0:
+        random.Random(1337).shuffle(data)
+        data = data[:max_per_task]
+
+    print0(f"Evaluating BFCL ({len(data)} examples)...")
+
+    task_meta = {
+        'task_type': 'tool_use',
+        'num_fewshot': 0,
+        'continuation_delimiter': ''
+    }
+
+    accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+    return {"accuracy": accuracy}
+
+
+# -----------------------------------------------------------------------------
 # CORE evaluation
 
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
@@ -191,7 +295,7 @@ def main():
 
     # Parse evaluation modes
     eval_modes = set(mode.strip() for mode in args.eval.split(','))
-    valid_modes = {'core', 'bpb', 'sample'}
+    valid_modes = {'core', 'bpb', 'sample', 'bfcl'}
     invalid = eval_modes - valid_modes
     if invalid:
         parser.error(f"Invalid eval modes: {invalid}. Valid: {valid_modes}")
@@ -224,6 +328,19 @@ def main():
     bpb_results = {}
     samples = []
     unconditioned_samples = []
+
+    # --- BFCL evaluation ---
+    bfcl_results = None
+    if 'bfcl' in eval_modes:
+        print0("\n" + "="*80)
+        print0("BFCL Evaluation")
+        print0("="*80)
+        with autocast_ctx:
+            bfcl_results = evaluate_bfcl(model, tokenizer, device, max_per_task=args.max_per_task)
+
+        # Write CSV output (reuse logic or specific file)
+        if ddp_rank == 0:
+            print0(f"BFCL Accuracy: {bfcl_results['accuracy']:.4f}")
 
     # --- CORE evaluation ---
     if 'core' in eval_modes:
@@ -308,6 +425,9 @@ def main():
     # --- Log to report ---
     from nanochat.report import get_report
     report_data = [{"model": model_name}]
+
+    if bfcl_results:
+        report_data[0]["BFCL Accuracy"] = bfcl_results["accuracy"]
 
     if core_results:
         report_data[0]["CORE metric"] = core_results["core_metric"]
