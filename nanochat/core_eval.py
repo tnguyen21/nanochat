@@ -6,10 +6,36 @@ TODOs:
 - All tasks ~match except for squad. We get 31% reference is 37%. Figure out why.
 """
 import random
+import ast
 
 from jinja2 import Template
 import torch
 import torch.distributed as dist
+
+def compare_function_calls(call1, call2):
+    """
+    Compare two function call strings for equivalence, ignoring argument order.
+    Returns True if they are equivalent, False otherwise.
+    """
+    try:
+        tree1 = ast.parse(call1.strip())
+        tree2 = ast.parse(call2.strip())
+    except SyntaxError:
+        return False
+
+    # Helper to canonicalize a function call AST node
+    def canonicalize(node):
+        if isinstance(node, ast.Call):
+            # Sort keywords by arg name
+            # Only sort if k.arg is not None (handles **kwargs)
+            node.keywords.sort(key=lambda k: (k.arg is None, k.arg))
+        for child in ast.iter_child_nodes(node):
+            canonicalize(child)
+
+    canonicalize(tree1)
+    canonicalize(tree2)
+
+    return ast.dump(tree1) == ast.dump(tree2)
 
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities
@@ -83,6 +109,31 @@ def render_prompts_lm(item, continuation_delimiter, fewshot_examples=None):
     return [prompt_without, prompt_with]
 
 
+def render_prompts_tool_use(item, continuation_delimiter, fewshot_examples=None):
+    """
+    Render complete prompt for a tool use task.
+    Similar to LM, but potentially customizable for function calling formats.
+    """
+    template_str = """
+{%- for example in fewshot_examples -%}
+{{ example.context | trim }}{{ continuation_delimiter }}{{ example.continuation }}
+
+{% endfor -%}
+{{ item.context | trim }}{{ continuation_delimiter }}{% if include_continuation %}{{ item.continuation }}{% endif %}""".strip()
+    template = Template(template_str)
+    fewshot_examples = fewshot_examples or []
+    context = {
+        'fewshot_examples': fewshot_examples,
+        'continuation_delimiter': continuation_delimiter,
+        'item': item
+    }
+    # Return two prompts: without and with the continuation
+    prompt_without = template.render(include_continuation=False, **context)
+    prompt_with = template.render(include_continuation=True, **context)
+    prompt_without = prompt_without.strip()
+    return [prompt_without, prompt_with]
+
+
 def find_common_length(token_sequences, direction='left'):
     """
     Find the length of the common prefix or suffix across token sequences
@@ -141,6 +192,20 @@ def batch_sequences_lm(tokenizer, prompts):
     return [tokens_with], [start_idx], [end_idx]
 
 
+def batch_sequences_tool_use(tokenizer, prompts):
+    # In tool use tasks, we have two prompts: without and with continuation
+    # We want to know where the continuation starts
+    tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
+    tokens_without, tokens_with = tokens
+    start_idx, end_idx = len(tokens_without), len(tokens_with)
+    assert start_idx < end_idx, "prompt without is supposed to be a prefix of prompt with"
+    # Note: we don't strictly assert prefix match here because some tokenizers might merge tokens differently
+    # at the boundary, but for now we assume they do.
+    # If they don't, start_idx might need adjustment, but let's stick to LM logic.
+    assert tokens_without == tokens_with[:start_idx], "prompt without is supposed to be a prefix of prompt with"
+    return [tokens_with], [start_idx], [end_idx]
+
+
 @torch.no_grad()
 def forward_model(model, input_ids):
     """
@@ -162,6 +227,31 @@ def forward_model(model, input_ids):
     # Get the argmax predictions at each position
     predictions = outputs.argmax(dim=-1)
     return losses, predictions
+
+
+@torch.no_grad()
+def generate_greedy(model, input_ids, max_new_tokens):
+    """Simple greedy generation loop"""
+    generated = []
+    curr_ids = input_ids.clone()
+
+    for _ in range(max_new_tokens):
+        outputs = model(curr_ids)
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+        elif hasattr(outputs, 'logits'):
+            logits = outputs.logits
+        else:
+            logits = outputs
+
+        next_token_logits = logits[:, -1, :]
+        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+        curr_ids = torch.cat([curr_ids, next_token], dim=1)
+        token_id = next_token.item()
+        generated.append(token_id)
+
+    return torch.tensor(generated, dtype=torch.long, device=input_ids.device)
 
 
 @torch.no_grad()
@@ -190,6 +280,9 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     elif task_type == 'language_modeling':
         prompts = render_prompts_lm(item, continuation_delimiter, fewshot_examples)
         tokens, start_idxs, end_idxs = batch_sequences_lm(tokenizer, prompts)
+    elif task_type == 'tool_use':
+        prompts = render_prompts_tool_use(item, continuation_delimiter, fewshot_examples)
+        tokens, start_idxs, end_idxs = batch_sequences_tool_use(tokenizer, prompts)
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
@@ -218,7 +311,11 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     input_ids = input_ids.to(device)
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token
-    losses, predictions = forward_model(model, input_ids)
+    # Note: For tool_use, we only forward to get losses if we cared about loss,
+    # but here we might want to skip it if we just do generation.
+    # However, to keep code structure simple, we can run it, or optimize to skip.
+    if task_type != 'tool_use':
+        losses, predictions = forward_model(model, input_ids)
 
     # See if the losses/predictions come out correctly
     if task_type == 'language_modeling':
@@ -229,6 +326,20 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         predicted_tokens = predictions[0, si-1:ei-1]
         actual_tokens = input_ids[0, si:ei]
         is_correct = torch.all(predicted_tokens == actual_tokens).item()
+    elif task_type == 'tool_use':
+        # tool use task is currently always batch size 1
+        si = start_idxs[0]
+        ei = end_idxs[0]
+
+        prompt_ids = input_ids[:, :si]
+        # Generate greedily
+        generated_ids = generate_greedy(model, prompt_ids, max_new_tokens=512)
+
+        # Decode and compare using AST
+        predicted_text = tokenizer.decode(generated_ids.tolist())
+        actual_tokens = input_ids[0, si:ei]
+        actual_text = tokenizer.decode(actual_tokens.tolist())
+        is_correct = compare_function_calls(predicted_text, actual_text)
     elif task_type in ['multiple_choice', 'schema']:
         # For MC/schema: find the option with lowest average loss
         mean_losses = [losses[i, si-1:ei-1].mean().item()
