@@ -143,6 +143,7 @@ def evaluate_bfcl(model, tokenizer, device, max_per_task=-1):
         print0(f"Error reading BFCL file: {e}")
         return {"accuracy": 0.0}
 
+    data = []
     # Format items
     for item in loaded_items:
         # Structure:
