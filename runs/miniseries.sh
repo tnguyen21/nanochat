@@ -40,7 +40,7 @@ RESULTS_FILE="$RESULTS_DIR/results.csv"
 
 # Write CSV header only if file doesn't exist
 if [ ! -f "$RESULTS_FILE" ]; then
-    echo "depth,model_dim,num_params,num_scaling_params,num_iterations,tokens_trained,param_data_ratio,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
+    echo "depth,model_dim,num_params,num_scaling_params,num_iterations,tokens_trained,param_data_ratio,val_bpb,core_score,bfcl_score,train_time_sec" > "$RESULTS_FILE"
 fi
 
 log() {
@@ -65,6 +65,8 @@ for d in "${DEPTHS[@]}"; do
         --model-tag="${TAG}" \
         --core-metric-every=999999 \
         --core-metric-max-per-task=-1 \
+        --bfcl-metric-every=999999 \
+        --bfcl-metric-max-per-task=-1 \
         --sample-every=-1 \
         --save-every=-1 \
         2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
@@ -82,15 +84,19 @@ for d in "${DEPTHS[@]}"; do
     MODEL_DIM=$((d * 64))
     VAL_BPB=$(grep "Validation bpb:" "$LOG_FILE" | tail -1 | grep -oP '[\d.]+$')
     CORE_SCORE=$(grep "CORE metric:" "$LOG_FILE" | tail -1 | awk '{print $NF}')
+    BFCL_SCORE=$(grep "BFCL metric:" "$LOG_FILE" | tail -1 | awk '{print $NF}')
 
     if [ -z "$CORE_SCORE" ]; then
         CORE_SCORE="0.0"
     fi
+    if [ -z "$BFCL_SCORE" ]; then
+        BFCL_SCORE="0.0"
+    fi
 
-    log "  d=$d: params=$NUM_PARAMS, scaling=$NUM_SCALING_PARAMS, ratio=$PARAM_DATA_RATIO, bpb=$VAL_BPB, CORE=$CORE_SCORE, time=${TRAIN_TIME}s"
+    log "  d=$d: params=$NUM_PARAMS, scaling=$NUM_SCALING_PARAMS, ratio=$PARAM_DATA_RATIO, bpb=$VAL_BPB, CORE=$CORE_SCORE, BFCL=$BFCL_SCORE, time=${TRAIN_TIME}s"
 
     # Append to CSV
-    echo "$d,$MODEL_DIM,$NUM_PARAMS,$NUM_SCALING_PARAMS,$NUM_ITERS,$TOKENS_TRAINED,$PARAM_DATA_RATIO,$VAL_BPB,$CORE_SCORE,$TRAIN_TIME" >> "$RESULTS_FILE"
+    echo "$d,$MODEL_DIM,$NUM_PARAMS,$NUM_SCALING_PARAMS,$NUM_ITERS,$TOKENS_TRAINED,$PARAM_DATA_RATIO,$VAL_BPB,$CORE_SCORE,$BFCL_SCORE,$TRAIN_TIME" >> "$RESULTS_FILE"
 done
 
 log "=============================================="
